@@ -24,10 +24,12 @@ import UserNotifications
 //   - exam-date.txt の保存を検知して即時反映 (ファイル監視)
 //   - 残100日以内オレンジ / 残30日以内赤 / 試験期間中は赤で「試験中」
 //   - 表示形式の切替 (残n日 / D-n / 数字のみ) — UserDefaults に保存
-//   - 節目 (100/50/30/7/1日) に一度だけ通知
-//   - 試験期間中は1日1回 (朝8時以降) 応援通知
+//   - 通知はルールベース (notifications.json)。メニューの「通知設定…」から
+//     タイミング (残n日 / 当日 / 期間中毎日) と文言を追加・変更・削除できる。
+//     文言中の {n} は残日数に置換。通知時刻 (n時以降) も設定可能。
 
 let configPath = ("~/ShihouCountdown/exam-date.txt" as NSString).expandingTildeInPath
+let notifConfigPath = ("~/ShihouCountdown/notifications.json" as NSString).expandingTildeInPath
 
 var calendar: Calendar = {
     var cal = Calendar(identifier: .gregorian)
@@ -135,6 +137,49 @@ func totalCycleDays(target: ExamTarget) -> Int {
     return calendar.dateComponents([.day], from: cycleStart, to: target.firstDay).day ?? 360
 }
 
+// MARK: - 通知ルール設定
+
+struct NotifRule: Codable {
+    var enabled: Bool = true
+    var kind: String = "before"   // "before"(残n日, days=0なら当日) | "examDay"(期間中毎日)
+    var days: Int = 30
+    var message: String = ""
+}
+
+struct NotifConfig: Codable {
+    var notifyHour: Int = 8       // この時刻(時)以降に通知する
+    var rules: [NotifRule]
+}
+
+func defaultNotifConfig() -> NotifConfig {
+    NotifConfig(notifyHour: 8, rules: [
+        NotifRule(kind: "before", days: 100, message: "試験まで残り {n} 日です。"),
+        NotifRule(kind: "before", days: 50,  message: "試験まで残り {n} 日です。"),
+        NotifRule(kind: "before", days: 30,  message: "試験まで残り {n} 日です。"),
+        NotifRule(kind: "before", days: 7,   message: "試験まで残り {n} 日です。"),
+        NotifRule(kind: "before", days: 1,   message: "いよいよ明日が試験1日目です。"),
+        NotifRule(kind: "examDay", days: 0,  message: "おつかれさまです。がんばってください。"),
+    ])
+}
+
+func loadNotifConfig() -> NotifConfig {
+    if let data = FileManager.default.contents(atPath: notifConfigPath),
+       let cfg = try? JSONDecoder().decode(NotifConfig.self, from: data) {
+        return cfg
+    }
+    let cfg = defaultNotifConfig()
+    saveNotifConfig(cfg)   // 初回はファイルを作って手編集もできるようにする
+    return cfg
+}
+
+func saveNotifConfig(_ cfg: NotifConfig) {
+    let enc = JSONEncoder()
+    enc.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+    if let data = try? enc.encode(cfg) {
+        try? data.write(to: URL(fileURLWithPath: notifConfigPath))
+    }
+}
+
 // MARK: - アプリ本体
 
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -147,7 +192,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let progressLabel = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     var formatItems: [NSMenuItem] = []
 
-    let milestones = [100, 50, 30, 7, 1]
+    var notifConfig = loadNotifConfig()
+    var settingsController: SettingsWindowController?
+    var settingsWindow: NSWindow? { settingsController?.window }
 
     var displayFormat: String {
         get { UserDefaults.standard.string(forKey: "displayFormat") ?? "kanji" }
@@ -169,6 +216,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                                 action: #selector(setExamDate), keyEquivalent: "d"))
         menu.addItem(NSMenuItem(title: "自動推定に戻す",
                                 action: #selector(useAutoEstimate), keyEquivalent: "a"))
+        menu.addItem(NSMenuItem(title: "通知設定…",
+                                action: #selector(openNotifSettings), keyEquivalent: "n"))
         menu.addItem(NSMenuItem(title: "設定ファイルを編集",
                                 action: #selector(editConfig), keyEquivalent: "e"))
         menu.addItem(NSMenuItem(title: "再読み込み",
@@ -196,6 +245,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         refresh()
         setupFileWatcher()
 
+        // 自己テスト用: --test-settings で通知設定画面を開いて生存確認
+        if CommandLine.arguments.contains("--test-settings") {
+            openNotifSettings()
+        }
+
         // 0時ちょうどの日付変更で更新
         NotificationCenter.default.addObserver(
             self, selector: #selector(refresh),
@@ -217,6 +271,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - 表示更新
 
     @objc func refresh() {
+        // 設定ウィンドウが開いていない時はディスクの最新設定を反映（手編集も拾う）
+        if settingsWindow == nil { notifConfig = loadNotifConfig() }
         let target = currentTarget(today: Date())
         let cd = computeCountdown(today: Date(), target: target)
 
@@ -279,33 +335,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func checkMilestones(_ cd: Countdown, examKey: String) {
         guard notificationsAvailable else { return }
 
-        // 試験期間中は1日1回、朝8時以降に応援通知
-        if cd.isExamPeriod {
-            let today = dateFormatter().string(from: Date())
-            let hour = calendar.component(.hour, from: Date())
-            let key = "cheered-\(today)"
-            if hour >= 8, !UserDefaults.standard.bool(forKey: key) {
-                UserDefaults.standard.set(true, forKey: key)
-                let content = UNMutableNotificationContent()
-                content.title = "司法試験カウントダウン"
-                content.body = "おつかれさまです。がんばってください。"
-                content.sound = .default
-                let req = UNNotificationRequest(identifier: "cheer-\(today)",
-                                                content: content, trigger: nil)
-                UNUserNotificationCenter.current().add(req)
-            }
-            return
-        }
+        // 通知時刻(n時)より前は通知しない
+        let hour = calendar.component(.hour, from: Date())
+        guard hour >= notifConfig.notifyHour else { return }
 
-        for m in milestones where cd.days == m {
-            let key = "notified-\(examKey)-\(m)"
-            guard !UserDefaults.standard.bool(forKey: key) else { continue }
-            UserDefaults.standard.set(true, forKey: key)
+        let today = dateFormatter().string(from: Date())
+
+        for (idx, rule) in notifConfig.rules.enumerated() {
+            guard rule.enabled else { continue }
+
+            let matches: Bool
+            let dedupeKey: String
+            switch rule.kind {
+            case "examDay":
+                // 試験期間中(初日〜最終日の5日間)は毎日通知。日付単位で重複防止
+                matches = cd.isExamPeriod
+                dedupeKey = "notif-\(idx)-\(today)"
+            default: // "before"
+                matches = !cd.isExamPeriod && cd.days == rule.days
+                dedupeKey = "notif-\(idx)-\(examKey)-\(rule.days)"
+            }
+            guard matches else { continue }
+            guard !UserDefaults.standard.bool(forKey: dedupeKey) else { continue }
+            UserDefaults.standard.set(true, forKey: dedupeKey)
+
             let content = UNMutableNotificationContent()
             content.title = "司法試験カウントダウン"
-            content.body = m == 1 ? "いよいよ明日が試験1日目です。" : "試験まで残り \(m) 日です。"
+            content.body = rule.message.replacingOccurrences(of: "{n}", with: "\(cd.days)")
             content.sound = .default
-            let req = UNNotificationRequest(identifier: "milestone-\(examKey)-\(m)",
+            let req = UNNotificationRequest(identifier: "\(dedupeKey)-\(UUID().uuidString)",
                                             content: content, trigger: nil)
             UNUserNotificationCenter.current().add(req)
         }
@@ -389,8 +447,276 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.open(URL(fileURLWithPath: configPath))
     }
 
+    @objc func openNotifSettings() {
+        NSApp.activate(ignoringOtherApps: true)
+        if let controller = settingsController {
+            controller.window.makeKeyAndOrderFront(nil)
+            return
+        }
+        let controller = SettingsWindowController(config: notifConfig) { [weak self] newConfig in
+            guard let self else { return }
+            saveNotifConfig(newConfig)
+            self.notifConfig = newConfig
+            self.refresh()
+        }
+        controller.onClose = { [weak self] in self?.settingsController = nil }
+        settingsController = controller
+        controller.window.makeKeyAndOrderFront(nil)
+    }
+
     @objc func quit() {
         NSApp.terminate(nil)
+    }
+}
+
+// MARK: - 通知設定ウィンドウ
+
+final class SettingsWindowController: NSObject, NSWindowDelegate,
+                                      NSTableViewDataSource, NSTableViewDelegate {
+    let window: NSWindow
+    let onSave: (NotifConfig) -> Void
+    var onClose: (() -> Void)?
+
+    var rules: [NotifRule]
+    var notifyHour: Int
+    let table = NSTableView()
+    let hourField = NSTextField()
+    let hourStepper = NSStepper()
+
+    init(config: NotifConfig, onSave: @escaping (NotifConfig) -> Void) {
+        self.rules = config.rules
+        self.notifyHour = config.notifyHour
+        self.onSave = onSave
+        window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 620, height: 460),
+            styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        super.init()
+        window.title = "通知設定"
+        window.delegate = self
+        window.center()
+        window.isReleasedWhenClosed = false
+        buildUI()
+    }
+
+    func buildUI() {
+        let content = NSView(frame: window.contentView!.bounds)
+        content.autoresizingMask = [.width, .height]
+        window.contentView = content
+
+        // 説明
+        let help = NSTextField(labelWithString:
+            "通知のタイミングと文言を編集できます。文言の {n} は残日数に置き換わります。")
+        help.font = .systemFont(ofSize: 11)
+        help.textColor = .secondaryLabelColor
+        help.frame = NSRect(x: 16, y: 428, width: 588, height: 18)
+        help.autoresizingMask = [.width, .minYMargin]
+        content.addSubview(help)
+
+        // 通知時刻
+        let hourLabel = NSTextField(labelWithString: "通知する時刻:")
+        hourLabel.frame = NSRect(x: 16, y: 398, width: 90, height: 20)
+        hourLabel.autoresizingMask = [.minYMargin]
+        content.addSubview(hourLabel)
+
+        hourField.frame = NSRect(x: 108, y: 396, width: 46, height: 22)
+        hourField.alignment = .right
+        hourField.integerValue = notifyHour
+        hourField.target = self
+        hourField.action = #selector(hourFieldChanged)
+        hourField.autoresizingMask = [.minYMargin]
+        content.addSubview(hourField)
+
+        hourStepper.frame = NSRect(x: 156, y: 395, width: 19, height: 24)
+        hourStepper.minValue = 0
+        hourStepper.maxValue = 23
+        hourStepper.integerValue = notifyHour
+        hourStepper.valueWraps = true
+        hourStepper.target = self
+        hourStepper.action = #selector(hourStepperChanged)
+        hourStepper.autoresizingMask = [.minYMargin]
+        content.addSubview(hourStepper)
+
+        let hourSuffix = NSTextField(labelWithString: "時以降（0時に鳴らないための設定）")
+        hourSuffix.font = .systemFont(ofSize: 11)
+        hourSuffix.textColor = .secondaryLabelColor
+        hourSuffix.frame = NSRect(x: 180, y: 398, width: 380, height: 18)
+        hourSuffix.autoresizingMask = [.minYMargin]
+        content.addSubview(hourSuffix)
+
+        // テーブル
+        let scroll = NSScrollView(frame: NSRect(x: 16, y: 92, width: 588, height: 296))
+        scroll.autoresizingMask = [.width, .height]
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+
+        func col(_ id: String, _ title: String, _ width: CGFloat) -> NSTableColumn {
+            let c = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
+            c.title = title
+            c.width = width
+            return c
+        }
+        table.addTableColumn(col("enabled", "有効", 42))
+        table.addTableColumn(col("kind", "タイミング", 150))
+        table.addTableColumn(col("days", "残日数", 64))
+        table.addTableColumn(col("message", "メッセージ（{n}=残日数）", 300))
+        table.usesAlternatingRowBackgroundColors = true
+        table.rowHeight = 26
+        table.dataSource = self
+        table.delegate = self
+        scroll.documentView = table
+        content.addSubview(scroll)
+
+        // ＋／－ ボタン
+        let addBtn = NSButton(title: "＋ 追加", target: self, action: #selector(addRule))
+        addBtn.bezelStyle = .rounded
+        addBtn.frame = NSRect(x: 16, y: 52, width: 90, height: 28)
+        addBtn.autoresizingMask = [.maxYMargin]
+        content.addSubview(addBtn)
+
+        let removeBtn = NSButton(title: "－ 削除", target: self, action: #selector(removeRule))
+        removeBtn.bezelStyle = .rounded
+        removeBtn.frame = NSRect(x: 112, y: 52, width: 90, height: 28)
+        removeBtn.autoresizingMask = [.maxYMargin]
+        content.addSubview(removeBtn)
+
+        let resetBtn = NSButton(title: "初期設定に戻す", target: self, action: #selector(resetRules))
+        resetBtn.bezelStyle = .rounded
+        resetBtn.frame = NSRect(x: 208, y: 52, width: 130, height: 28)
+        resetBtn.autoresizingMask = [.maxYMargin]
+        content.addSubview(resetBtn)
+
+        // 保存／キャンセル
+        let saveBtn = NSButton(title: "保存", target: self, action: #selector(saveAndClose))
+        saveBtn.bezelStyle = .rounded
+        saveBtn.keyEquivalent = "\r"
+        saveBtn.frame = NSRect(x: 514, y: 14, width: 90, height: 30)
+        saveBtn.autoresizingMask = [.maxYMargin]
+        content.addSubview(saveBtn)
+
+        let cancelBtn = NSButton(title: "キャンセル", target: self, action: #selector(cancel))
+        cancelBtn.bezelStyle = .rounded
+        cancelBtn.keyEquivalent = "\u{1b}"
+        cancelBtn.frame = NSRect(x: 410, y: 14, width: 100, height: 30)
+        cancelBtn.autoresizingMask = [.maxYMargin]
+        content.addSubview(cancelBtn)
+    }
+
+    // MARK: テーブル データ
+
+    func numberOfRows(in tableView: NSTableView) -> Int { rules.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?,
+                   row: Int) -> NSView? {
+        guard let id = tableColumn?.identifier.rawValue else { return nil }
+        let rule = rules[row]
+        switch id {
+        case "enabled":
+            let cb = NSButton(checkboxWithTitle: "", target: self, action: #selector(toggleEnabled(_:)))
+            cb.state = rule.enabled ? .on : .off
+            return cb
+        case "kind":
+            let pop = NSPopUpButton(frame: .zero, pullsDown: false)
+            pop.addItems(withTitles: ["残n日前", "試験期間中（毎日）"])
+            pop.selectItem(at: rule.kind == "examDay" ? 1 : 0)
+            pop.target = self
+            pop.action = #selector(kindChanged(_:))
+            return pop
+        case "days":
+            let tf = NSTextField()
+            tf.alignment = .right
+            tf.isEnabled = (rule.kind != "examDay")
+            tf.stringValue = rule.kind == "examDay" ? "—" : "\(rule.days)"
+            tf.target = self
+            tf.action = #selector(daysChanged(_:))
+            return tf
+        case "message":
+            let tf = NSTextField()
+            tf.stringValue = rule.message
+            tf.target = self
+            tf.action = #selector(messageChanged(_:))
+            return tf
+        default:
+            return nil
+        }
+    }
+
+    // MARK: 行編集ハンドラ（row(for:) で行を特定し、reload後のズレを防ぐ）
+
+    @objc func toggleEnabled(_ sender: NSButton) {
+        let r = table.row(for: sender); guard r >= 0 else { return }
+        rules[r].enabled = (sender.state == .on)
+    }
+
+    @objc func kindChanged(_ sender: NSPopUpButton) {
+        let r = table.row(for: sender); guard r >= 0 else { return }
+        rules[r].kind = sender.indexOfSelectedItem == 1 ? "examDay" : "before"
+        table.reloadData()
+    }
+
+    @objc func daysChanged(_ sender: NSTextField) {
+        let r = table.row(for: sender); guard r >= 0 else { return }
+        if let v = Int(sender.stringValue), v >= 0 { rules[r].days = v }
+        else { sender.stringValue = "\(rules[r].days)" }
+    }
+
+    @objc func messageChanged(_ sender: NSTextField) {
+        let r = table.row(for: sender); guard r >= 0 else { return }
+        rules[r].message = sender.stringValue
+    }
+
+    // MARK: ボタン
+
+    @objc func addRule() {
+        commitFields()
+        rules.append(NotifRule(enabled: true, kind: "before", days: 10, message: "試験まで残り {n} 日です。"))
+        table.reloadData()
+        table.selectRowIndexes(IndexSet(integer: rules.count - 1), byExtendingSelection: false)
+    }
+
+    @objc func removeRule() {
+        commitFields()
+        let r = table.selectedRow
+        guard r >= 0 && r < rules.count else { NSSound.beep(); return }
+        rules.remove(at: r)
+        table.reloadData()
+    }
+
+    @objc func resetRules() {
+        let def = defaultNotifConfig()
+        rules = def.rules
+        notifyHour = def.notifyHour
+        hourField.integerValue = notifyHour
+        hourStepper.integerValue = notifyHour
+        table.reloadData()
+    }
+
+    @objc func hourFieldChanged() {
+        let v = min(23, max(0, hourField.integerValue))
+        notifyHour = v; hourField.integerValue = v; hourStepper.integerValue = v
+    }
+
+    @objc func hourStepperChanged() {
+        notifyHour = hourStepper.integerValue
+        hourField.integerValue = notifyHour
+    }
+
+    /// テキストフィールド編集中の値を確定させる
+    func commitFields() {
+        window.makeFirstResponder(table)
+    }
+
+    @objc func saveAndClose() {
+        commitFields()
+        onSave(NotifConfig(notifyHour: notifyHour, rules: rules))
+        window.close()
+    }
+
+    @objc func cancel() {
+        window.close()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        onClose?()
     }
 }
 

@@ -2,5 +2,8 @@
 ShihouCountdown
 *.app
 
+# user-local notification state (auto-created with defaults on first run)
+notifications.json
+
 # macOS
 .DS_Store
