@@ -1,0 +1,6 @@
+# build output
+ShihouCountdown
+*.app
+
+# macOS
+.DS_Store

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.yuki.shihoucountdown</string>
+    <key>ProgramArguments</key>
+    <array>
+        <!-- USERNAME を自分のユーザー名に置き換えてください -->
+        <string>/Users/USERNAME/Applications/ShihouCountdown.app/Contents/MacOS/ShihouCountdown</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <!-- クラッシュ時のみ自動復帰。メニューの「終了」では再起動しない -->
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>AssociatedBundleIdentifiers</key>
+    <string>com.yuki.shihoucountdown</string>
+</dict>
+</plist>
