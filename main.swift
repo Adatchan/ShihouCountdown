@@ -249,6 +249,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if CommandLine.arguments.contains("--test-settings") {
             openNotifSettings()
         }
+        // 自己テスト用: --selftest-save で「テキスト欄編集→保存→ファイル反映」を検証
+        if CommandLine.arguments.contains("--selftest-save") {
+            runSaveSelfTest()
+        }
 
         // 0時ちょうどの日付変更で更新
         NotificationCenter.default.addObserver(
@@ -467,12 +471,44 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func quit() {
         NSApp.terminate(nil)
     }
+
+    /// 「最終行を追加→残日数と文言をキーボード編集→保存」までを実際のUI経路で再現し、
+    /// notifications.json に反映されるか検証する。
+    func runSaveSelfTest() {
+        let c = SettingsWindowController(config: loadNotifConfig()) { cfg in
+            saveNotifConfig(cfg)
+        }
+        c.window.makeKeyAndOrderFront(nil)
+        c.addRule()                                   // 末尾に新規ルール
+        let last = c.rules.count - 1
+        // 残日数フィールドを実際に取得して編集イベントを発火
+        guard let daysView = c.table.view(atColumn: 2, row: last, makeIfNecessary: true) as? NSTextField,
+              let msgView  = c.table.view(atColumn: 3, row: last, makeIfNecessary: true) as? NSTextField else {
+            print("SELFTEST: FAIL (cell views not found)"); exit(2)
+        }
+        daysView.stringValue = "330"
+        c.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: daysView))
+        msgView.stringValue = "司法試験から1ヶ月経ちました。"
+        c.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: msgView))
+        c.saveAndClose()
+
+        let saved = loadNotifConfig()
+        let ok = saved.rules.contains { $0.days == 330 && $0.message == "司法試験から1ヶ月経ちました。" }
+        print("SELFTEST: \(ok ? "PASS" : "FAIL") — saved rules=\(saved.rules.count)")
+        exit(ok ? 0 : 1)
+    }
 }
 
 // MARK: - 通知設定ウィンドウ
 
 final class SettingsWindowController: NSObject, NSWindowDelegate,
-                                      NSTableViewDataSource, NSTableViewDelegate {
+                                      NSTableViewDataSource, NSTableViewDelegate,
+                                      NSTextFieldDelegate {
+    // テキスト欄の種別 (tag)
+    static let tagDays = 1
+    static let tagMessage = 2
+    static let tagHour = 3
+
     let window: NSWindow
     let onSave: (NotifConfig) -> Void
     var onClose: (() -> Void)?
@@ -521,8 +557,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate,
         hourField.frame = NSRect(x: 108, y: 396, width: 46, height: 22)
         hourField.alignment = .right
         hourField.integerValue = notifyHour
-        hourField.target = self
-        hourField.action = #selector(hourFieldChanged)
+        hourField.tag = Self.tagHour
+        hourField.delegate = self
         hourField.autoresizingMask = [.minYMargin]
         content.addSubview(hourField)
 
@@ -626,14 +662,14 @@ final class SettingsWindowController: NSObject, NSWindowDelegate,
             tf.alignment = .right
             tf.isEnabled = (rule.kind != "examDay")
             tf.stringValue = rule.kind == "examDay" ? "—" : "\(rule.days)"
-            tf.target = self
-            tf.action = #selector(daysChanged(_:))
+            tf.tag = Self.tagDays
+            tf.delegate = self          // 1文字ごとにモデルへ反映
             return tf
         case "message":
             let tf = NSTextField()
             tf.stringValue = rule.message
-            tf.target = self
-            tf.action = #selector(messageChanged(_:))
+            tf.tag = Self.tagMessage
+            tf.delegate = self          // 1文字ごとにモデルへ反映
             return tf
         default:
             return nil
@@ -653,15 +689,23 @@ final class SettingsWindowController: NSObject, NSWindowDelegate,
         table.reloadData()
     }
 
-    @objc func daysChanged(_ sender: NSTextField) {
-        let r = table.row(for: sender); guard r >= 0 else { return }
-        if let v = Int(sender.stringValue), v >= 0 { rules[r].days = v }
-        else { sender.stringValue = "\(rules[r].days)" }
-    }
-
-    @objc func messageChanged(_ sender: NSTextField) {
-        let r = table.row(for: sender); guard r >= 0 else { return }
-        rules[r].message = sender.stringValue
+    // テキスト欄は1文字ごとに controlTextDidChange でモデルへ即反映する。
+    // これにより「入力しただけで保存を押すと取りこぼす」問題を防ぐ。
+    func controlTextDidChange(_ notification: Notification) {
+        guard let tf = notification.object as? NSTextField else { return }
+        if tf === hourField {
+            if let v = Int(tf.stringValue) { notifyHour = min(23, max(0, v)) }
+            return
+        }
+        let r = table.row(for: tf); guard r >= 0, r < rules.count else { return }
+        switch tf.tag {
+        case Self.tagDays:
+            if let v = Int(tf.stringValue), v >= 0 { rules[r].days = v }
+        case Self.tagMessage:
+            rules[r].message = tf.stringValue
+        default:
+            break
+        }
     }
 
     // MARK: ボタン
@@ -690,19 +734,17 @@ final class SettingsWindowController: NSObject, NSWindowDelegate,
         table.reloadData()
     }
 
-    @objc func hourFieldChanged() {
-        let v = min(23, max(0, hourField.integerValue))
-        notifyHour = v; hourField.integerValue = v; hourStepper.integerValue = v
-    }
-
     @objc func hourStepperChanged() {
         notifyHour = hourStepper.integerValue
         hourField.integerValue = notifyHour
     }
 
-    /// テキストフィールド編集中の値を確定させる
+    /// 編集中のテキスト欄を確定させる (保険。実データは controlTextDidChange で反映済み)
     func commitFields() {
-        window.makeFirstResponder(table)
+        window.makeFirstResponder(nil)
+        notifyHour = min(23, max(0, notifyHour))
+        hourField.integerValue = notifyHour
+        hourStepper.integerValue = notifyHour
     }
 
     @objc func saveAndClose() {
