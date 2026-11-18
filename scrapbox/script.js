@@ -1,0 +1,102 @@
+// 司法試験カウントダウン for Scrapbox (UserScript)
+//
+// 日程の自動推定 (macOS 版と同じ法則):
+//   海の日 = 7月の第3月曜日
+//   初日   = 海の日 - 5日 (水曜) / 最終日 = 海の日 - 1日 (日曜)
+//   最終日を過ぎたら翌年の推定日程へ自動切替
+// 公式日程が推定とズレた年は MANUAL_FIRST_DAY に初日を書く (例: '2027-07-14')。
+// その試験が終わると自動推定に戻る。
+(() => {
+  const MANUAL_FIRST_DAY = null; // 例: '2027-07-14'
+  const FONT = '"BIZ UDGothic", "BIZ UDゴシック", "Hiragino Sans", sans-serif';
+
+  const startOfDay = d => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const addDays = (d, n) => new Date(d.getFullYear(), d.getMonth(), d.getDate() + n);
+  const diffDays = (a, b) => Math.round((startOfDay(b) - startOfDay(a)) / 86400000);
+  const fmt = d => `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`;
+
+  // 7月の第3月曜日
+  const marineDay = year => {
+    const jul1 = new Date(year, 6, 1);
+    const firstMon = 1 + ((8 - jul1.getDay()) % 7);
+    return new Date(year, 6, firstMon + 14);
+  };
+  const autoExam = year => {
+    const m = marineDay(year);
+    return { first: addDays(m, -5), last: addDays(m, -1), manual: false };
+  };
+
+  // 今日以降で最初に終わっていない試験
+  const nextExam = today => {
+    if (MANUAL_FIRST_DAY) {
+      const [y, mo, d] = MANUAL_FIRST_DAY.split('-').map(Number);
+      const first = new Date(y, mo - 1, d);
+      const exam = { first, last: addDays(first, 4), manual: true };
+      if (today <= exam.last) return exam;
+    }
+    let exam = autoExam(today.getFullYear());
+    if (today > exam.last) exam = autoExam(today.getFullYear() + 1);
+    return exam;
+  };
+
+  const compute = () => {
+    const today = startOfDay(new Date());
+    const exam = nextExam(today);
+    const days = diffDays(today, exam.first);
+    const inExam = days <= 0;
+    // 進捗: 前回試験の翌日 → 今回の初日
+    const prevLast = autoExam(exam.first.getFullYear() - 1).last;
+    const total = diffDays(prevLast, exam.first);
+    const elapsed = Math.min(total, Math.max(0, diffDays(prevLast, today)));
+    const pct = inExam ? 100 : Math.floor((elapsed / total) * 100);
+    return { today, exam, days, inExam, pct, elapsed, total,
+             dayOfExam: inExam ? diffDays(exam.first, today) + 1 : 0 };
+  };
+
+  const color = s => s.inExam || s.days <= 30 ? '#d32f2f' : s.days <= 100 ? '#ef6c00' : '#333';
+
+  // バッジ (画面右下に常時表示)
+  const badge = document.createElement('div');
+  badge.id = 'shihou-countdown';
+  Object.assign(badge.style, {
+    position: 'fixed', right: '16px', bottom: '16px', zIndex: 9999,
+    padding: '6px 12px', borderRadius: '16px', background: 'rgba(255,255,255,.92)',
+    boxShadow: '0 1px 4px rgba(0,0,0,.25)', fontFamily: FONT, fontSize: '14px',
+    fontWeight: 'bold', cursor: 'pointer', userSelect: 'none',
+  });
+  badge.title = 'クリックで詳細表示・コピー';
+  document.getElementById('shihou-countdown')?.remove();
+  document.body.appendChild(badge);
+
+  const detail = s => {
+    const bar = '■'.repeat(Math.floor(s.pct / 10)) + '□'.repeat(10 - Math.floor(s.pct / 10));
+    return [
+      s.inExam ? `司法試験 ${s.dayOfExam}日目` : `司法試験まで残り ${s.days} 日`,
+      `試験期間: ${fmt(s.exam.first)} 〜 ${fmt(s.exam.last)}（${s.exam.manual ? '手動設定' : '自動推定'}）`,
+      `${bar} ${s.pct}%（経過 ${s.elapsed}/${s.total} 日）`,
+    ].join('\n');
+  };
+
+  const render = () => {
+    const s = compute();
+    badge.textContent = s.inExam ? `試験中（${s.dayOfExam}日目）` : `司法試験まで残${s.days}日`;
+    badge.style.color = color(s);
+    return s;
+  };
+  // クリックで詳細表示＋「司法試験まで残n日」をクリップボードにコピー
+  badge.addEventListener('click', () => {
+    const s = render();
+    navigator.clipboard?.writeText(badge.textContent).catch(() => {});
+    alert(`${detail(s)}\n\n「${badge.textContent}」をコピーしました`);
+  });
+
+  // 0時ちょうど・タブ復帰時に更新
+  const scheduleMidnight = () => {
+    const now = new Date();
+    setTimeout(() => { render(); scheduleMidnight(); }, addDays(startOfDay(now), 1) - now + 1000);
+  };
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) render(); });
+
+  render();
+  scheduleMidnight();
+})();
